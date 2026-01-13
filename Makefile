@@ -15,6 +15,7 @@ RPATH    := -Wl,-rpath,$(CONDA_PREFIX)/lib   # macOS runtime fix
 # ---------------- Python ----------------
 PY      ?= python3
 VIZ_PY  := viz_h5.py
+VIZ3D_PY := viz_h5_3d.py
 GIFDIR  := gifs
 
 # Diagnostics flags for viz_h5.py
@@ -53,6 +54,11 @@ MHD2D_CPP := mhd2d_resistive_hlld_ct_gravity.cpp
 MHD2D_BIN := mhd2d_resistive_hlld_ct_gravity
 MHD2D_H5  := out2d_mhd.h5
 
+# 3D Resistive MHD (HLLD + CT)
+MHD3D_CPP := mhd3d_resistive_hlld_ct.cpp
+MHD3D_BIN := mhd3d_resistive_hlld_ct
+MHD3D_H5  := out3d_mhd.h5
+
 # ---------------- Phony ----------------
 .PHONY: all clean info dirs \
         build_sph run_sph viz_sph \
@@ -60,12 +66,13 @@ MHD2D_H5  := out2d_mhd.h5
         build_2d_hllc run_2d_hllc viz_2d_hllc \
         build_ns2d run_ns2d viz_ns2d \
         build_mhd2d run_mhd2d viz_mhd2d \
+        build_mhd3d run_mhd3d viz_mhd3d \
         viz_all
 
 # Default: build + run + visualize all
 all: viz_all
 
-viz_all: viz_sph viz_2d viz_2d_hllc viz_ns2d viz_mhd2d
+viz_all: viz_sph viz_2d viz_2d_hllc viz_ns2d viz_mhd2d viz_mhd3d
 
 # ---------------- Info ----------------
 info:
@@ -170,8 +177,26 @@ viz_mhd2d: run_mhd2d dirs
 		--fields /rho,/P,/Mach,/Bx,/By,/Bz,/divB \
 		$(VIZ_DIAG_FLAGS)
 
+# ============================
+# 3D Resistive MHD (HLLD + CT)
+# ============================
+build_mhd3d: $(MHD3D_BIN)
+
+$(MHD3D_BIN): $(MHD3D_CPP) Makefile
+	$(CXX) $(CXXFLAGS) $(MHD3D_CPP) -o $(MHD3D_BIN) \
+		$(INCLUDES) $(LIBS) $(RPATH) $(LDFLAGS)
+
+run_mhd3d: build_mhd3d
+	./$(MHD3D_BIN)
+
+viz_mhd3d: run_mhd3d dirs
+	@mkdir -p $(GIFDIR)/mhd3d
+	$(PY) $(VIZ3D_PY) $(MHD3D_H5) \
+		--outdir $(GIFDIR)/mhd3d \
+		--fields /P,/Bmag --gif --log
+
 # ---------------- Clean ----------------
 clean:
-	rm -f $(SPH_BIN) $(E2D_BIN) $(E2D_HLLC_BIN) $(NS2D_BIN) $(MHD2D_BIN) \
-	      $(SPH_H5) $(E2D_H5) $(E2D_HLLC_H5) $(NS2D_H5) $(MHD2D_H5)
+	rm -f $(SPH_BIN) $(E2D_BIN) $(E2D_HLLC_BIN) $(NS2D_BIN) $(MHD2D_BIN) $(MHD3D_BIN) \
+	      $(SPH_H5) $(E2D_H5) $(E2D_HLLC_H5) $(NS2D_H5) $(MHD2D_H5) $(MHD3D_H5)
 	rm -rf $(GIFDIR)
