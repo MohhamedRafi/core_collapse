@@ -1,0 +1,13 @@
+name: ccsn_sph1d
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - h5py
+  - hdf5
+  - pillow
+  - compilers
+  - make
+  - pkg-config
