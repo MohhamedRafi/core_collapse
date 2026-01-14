@@ -41,7 +41,16 @@ static inline size_t idx(int i, int j, int k, int Nx, int Ny) {
 static inline int imod(int i, int n){ int r=i%n; return (r<0)?r+n:r; }
 
 struct Params {
-    double gamma = 5.0/3.0;
+    // hybrid EOS (cold + thermal + bounce stiffening)
+    double gamma1 = 1.30;
+    double gamma2 = 2.50;
+    double K1 = 0.05;
+    double rho_nuc = 80.0;
+    double gamma_th = 1.50;
+    double rho_bounce = 120.0;
+    double gamma_bounce = 3.00;
+    double Kbounce = 0.02;
+    double gamma_init = 5.0/3.0;
     double cfl   = 0.4;
 
     double x0=0.0, x1=1.0;
@@ -102,17 +111,75 @@ static inline double mc_limiter(double dm, double dp){
     return minmod(0.5*(dm+dp), minmod(2.0*dm, 2.0*dp));
 }
 
+// ------------------------------- Hybrid EOS with bounce stiffening -------------------------------
+
+struct ColdEOS { double Pcold, ecold, gamma_c; };
+
+static inline ColdEOS eos_cold(const Params& p, double rho){
+    rho = std::max(rho, p.floor_rho);
+    double K2 = p.K1 * std::pow(p.rho_nuc, p.gamma1 - p.gamma2);
+
+    if (rho < p.rho_nuc){
+        double Pc = p.K1 * std::pow(rho, p.gamma1);
+        double ec = p.K1 * std::pow(rho, p.gamma1 - 1.0) / (p.gamma1 - 1.0);
+        return {Pc, ec, p.gamma1};
+    }
+
+    double Pc = K2 * std::pow(rho, p.gamma2);
+    double ec1_n = p.K1 * std::pow(p.rho_nuc, p.gamma1 - 1.0) / (p.gamma1 - 1.0);
+    double ec2_n = K2   * std::pow(p.rho_nuc, p.gamma2 - 1.0) / (p.gamma2 - 1.0);
+    double ec = ec1_n + (K2 * std::pow(rho, p.gamma2 - 1.0) / (p.gamma2 - 1.0) - ec2_n);
+
+    double gamma_c = p.gamma2;
+    if (rho >= p.rho_bounce){
+        double pb = p.Kbounce * (std::pow(rho, p.gamma_bounce) - std::pow(p.rho_bounce, p.gamma_bounce));
+        double eb = p.Kbounce * (std::pow(rho, p.gamma_bounce - 1.0) -
+                                 std::pow(p.rho_bounce, p.gamma_bounce - 1.0)) / (p.gamma_bounce - 1.0);
+        Pc += pb;
+        ec += eb;
+        gamma_c = (p.gamma2 * (Pc - pb) + p.gamma_bounce * pb) / std::max(Pc, p.floor_P);
+    }
+
+    return {Pc, ec, gamma_c};
+}
+
+static inline double pressure_from_rho_espec(const Params& p, double rho, double e_spec){
+    rho = std::max(rho, p.floor_rho);
+    auto cold = eos_cold(p, rho);
+    double eth = std::max(0.0, e_spec - cold.ecold);
+    double Pth = (p.gamma_th - 1.0) * rho * eth;
+    return std::max(cold.Pcold + Pth, p.floor_P);
+}
+
+static inline double total_energy_from_prim(const Params& p, const Prim& W){
+    double rho = std::max(W.rho, p.floor_rho);
+    double kin = 0.5*rho*(W.u*W.u + W.v*W.v + W.w*W.w);
+    double mag = 0.5*(W.Bx*W.Bx + W.By*W.By + W.Bz*W.Bz);
+    auto cold = eos_cold(p, rho);
+    double Pth = std::max(0.0, W.P - cold.Pcold);
+    double eth = (p.gamma_th > 1.0) ? (Pth / ((p.gamma_th - 1.0)*rho)) : 0.0;
+    double eint = rho * (cold.ecold + eth);
+    return kin + mag + eint;
+}
+
 static inline void enforce_floors(const Params& p, double& rho, double& mx, double& my, double& mz, double& E,
                                   double Bx, double By, double Bz){
     rho = std::max(rho, p.floor_rho);
     double u = mx/rho, v = my/rho, w = mz/rho;
     double kin = 0.5*rho*(u*u+v*v+w*w);
     double mag = 0.5*(Bx*Bx+By*By+Bz*Bz);
-    double P = (p.gamma-1.0)*(E - kin - mag);
-    if (P < p.floor_P){
-        double eint = p.floor_P/(p.gamma-1.0);
-        E = kin + mag + eint;
-    }
+    double eint_tot = E - kin - mag;
+    if (eint_tot < 0.0) eint_tot = 0.0;
+
+    double e_spec = eint_tot / rho;
+    double P = pressure_from_rho_espec(p, rho, e_spec);
+    if (P < p.floor_P) P = p.floor_P;
+
+    auto cold = eos_cold(p, rho);
+    double Pth = std::max(0.0, P - cold.Pcold);
+    double eth = (p.gamma_th > 1.0) ? (Pth / ((p.gamma_th - 1.0)*rho)) : 0.0;
+    double eint_new = rho * (cold.ecold + eth);
+    E = kin + mag + eint_new;
 }
 
 static inline Prim cons_to_prim(const Params& p, double rho, double mx, double my, double mz, double E,
@@ -121,7 +188,10 @@ static inline Prim cons_to_prim(const Params& p, double rho, double mx, double m
     double u = mx/rho, v = my/rho, w = mz/rho;
     double kin = 0.5*rho*(u*u+v*v+w*w);
     double mag = 0.5*(Bx*Bx+By*By+Bz*Bz);
-    double P = (p.gamma-1.0)*(E - kin - mag);
+    double eint_tot = E - kin - mag;
+    if (eint_tot < 0.0) eint_tot = 0.0;
+    double e_spec = eint_tot / rho;
+    double P = pressure_from_rho_espec(p, rho, e_spec);
     if (P < p.floor_P) P = p.floor_P;
     return {rho,u,v,w,P,Bx,By,Bz};
 }
@@ -130,14 +200,15 @@ static inline void prim_to_cons(const Params& p, const Prim& W,
                                 double& rho, double& mx, double& my, double& mz, double& E){
     rho = std::max(W.rho, p.floor_rho);
     mx = rho*W.u; my = rho*W.v; mz = rho*W.w;
-    double kin = 0.5*rho*(W.u*W.u+W.v*W.v+W.w*W.w);
-    double mag = 0.5*(W.Bx*W.Bx+W.By*W.By+W.Bz*W.Bz);
-    double eint = W.P/(p.gamma-1.0);
-    E = kin + mag + eint;
+    E  = total_energy_from_prim(p, W);
 }
 
 static inline double sound_speed2(const Params& p, const Prim& W){
-    return p.gamma * W.P / std::max(W.rho, p.floor_rho);
+    double rho = std::max(W.rho, p.floor_rho);
+    auto cold = eos_cold(p, rho);
+    double Pth = std::max(0.0, W.P - cold.Pcold);
+    double num = cold.gamma_c * cold.Pcold + p.gamma_th * Pth;
+    return std::max(0.0, num / rho);
 }
 
 static inline double fast_speed_x(const Params& p, const Prim& W){
@@ -325,10 +396,9 @@ struct FluxX {
 static inline FluxX flux_ideal_x(const Params& p, const Prim& W){
     double rho=W.rho, u=W.u, v=W.v, w=W.w, P=W.P;
     double Bx=W.Bx, By=W.By, Bz=W.Bz;
-    double v2=u*u+v*v+w*w;
     double B2=Bx*Bx+By*By+Bz*Bz;
     double pt=P+0.5*B2;
-    double E=P/(p.gamma-1.0)+0.5*rho*v2+0.5*B2;
+    double E = total_energy_from_prim(p, W);
     double vdotB = u*Bx+v*By+w*Bz;
 
     FluxX F{};
@@ -366,8 +436,7 @@ static inline FluxX hlld_x(const Params& p, Prim WL, Prim WR, double Bn){
     auto cons7 = [&](const Prim& W){
         double rho=W.rho;
         double mx=rho*W.u, my=rho*W.v, mz=rho*W.w;
-        double B2=W.Bx*W.Bx+W.By*W.By+W.Bz*W.Bz;
-        double E=W.P/(p.gamma-1.0)+0.5*rho*(W.u*W.u+W.v*W.v+W.w*W.w)+0.5*B2;
+        double E = total_energy_from_prim(p, W);
         return std::array<double,7>{rho,mx,my,mz,E,W.By,W.Bz};
     };
     auto UL = cons7(WL);
@@ -450,8 +519,7 @@ static inline FluxX hlld_x(const Params& p, Prim WL, Prim WR, double Bn){
     }
 
     auto state7 = [&](const Prim& W){
-        double B2=W.Bx*W.Bx+W.By*W.By+W.Bz*W.Bz;
-        double E=W.P/(p.gamma-1.0)+0.5*W.rho*(W.u*W.u+W.v*W.v+W.w*W.w)+0.5*B2;
+        double E = total_energy_from_prim(p, W);
         return std::array<double,7>{W.rho, W.rho*W.u, W.rho*W.v, W.rho*W.w, E, W.By, W.Bz};
     };
 
@@ -463,8 +531,7 @@ static inline FluxX hlld_x(const Params& p, Prim WL, Prim WR, double Bn){
 
         double Bx=Bn, By=By_s, Bz=Bz_s;
 
-        double B2W = Wref.Bx*Wref.Bx + Wref.By*Wref.By + Wref.Bz*Wref.Bz;
-        double EW = Wref.P/(p.gamma-1.0) + 0.5*Wref.rho*(Wref.u*Wref.u+Wref.v*Wref.v+Wref.w*Wref.w) + 0.5*B2W;
+        double EW = total_energy_from_prim(p, Wref);
 
         double vdotB_s = SM*Bx + v_s*By + w_s*Bz;
         double vdotB_w = Wref.u*Wref.Bx + Wref.v*Wref.By + Wref.w*Wref.Bz;
@@ -1179,7 +1246,7 @@ int main(){
                 double core_shape = 0.5*(1.0 - std::tanh(s));
 
                 double rho = p.rho_bg + (p.rho_core - p.rho_bg)*core_shape;
-                double P = p.P0 * std::pow(rho/p.rho_bg, p.gamma);
+                double P = p.P0 * std::pow(rho/p.rho_bg, p.gamma_init);
 
                 double u=0.0, v=0.0, w=0.0;
                 double vin = p.vin * core_shape;
